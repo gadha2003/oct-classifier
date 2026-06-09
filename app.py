@@ -198,9 +198,27 @@ def setup_output_folders():
         return None
 
 def upload_to_grade_folder(source_file_id, dest_folder_id, filename, mime="image/jpeg"):
-    """Download from source, upload to grade folder. Service account owns dest."""
+    """Copy file to grade folder. Tries copy API first, then download+upload."""
     drive = get_drive()
-    # Download
+
+    # Skip if already exists in destination
+    q = f"'{dest_folder_id}' in parents and name='{filename}' and trashed=false"
+    existing = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if existing:
+        return existing[0]["id"]
+
+    # Method 1: Simple copy (fastest)
+    try:
+        result = drive.files().copy(
+            fileId=source_file_id,
+            body={"name": filename, "parents": [dest_folder_id]},
+            fields="id",
+        ).execute()
+        return result["id"]
+    except Exception:
+        pass
+
+    # Method 2: Download then upload
     request = drive.files().get_media(fileId=source_file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
@@ -208,14 +226,6 @@ def upload_to_grade_folder(source_file_id, dest_folder_id, filename, mime="image
     while not done:
         _, done = downloader.next_chunk()
     buf.seek(0)
-
-    # Check if file already exists in dest (avoid duplicates)
-    q = f"'{dest_folder_id}' in parents and name='{filename}' and trashed=false"
-    existing = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
-    if existing:
-        return existing[0]["id"]
-
-    # Upload (non-resumable for small files — more reliable)
     media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
     result = drive.files().create(
         body={"name": filename, "parents": [dest_folder_id]},
@@ -362,18 +372,16 @@ def load_images_from_drive():
     already = len(classified_set & {f["name"] for f in images})
     folders_ok = "files sorted" if output else "sheet-only"
     st.toast(f"✅ {len(images)} images · {already} done · {folders_ok}", icon="🎉")
-    
 def classify(grade):
     img = st.session_state.images[st.session_state.idx]
     fname = img["name"]
     file_id = img["id"]
     mime = img.get("mime", "image/jpeg")
 
-    # ── Remove old classification if re-labeling
+    # Remove old classification if re-labeling
     old = st.session_state.classifications.get(fname)
     if old and old != grade:
         remove_from_sheet(fname, st.session_state.annotator)
-        # Try removing old file from Drive grade folder
         output = st.session_state.output_folders
         if output:
             old_folder_id = output["grades"].get(GRADES[old]["folder"])
@@ -383,22 +391,21 @@ def classify(grade):
                 except Exception:
                     pass
 
-    # ── 1. Always log to Sheet (source of truth — never fails)
+    # 1. Always log to Sheet (never fails)
     append_to_sheet(st.session_state.annotator, fname, grade, file_id)
 
-    # ── 2. Try to copy file to grade folder on Drive (bonus — may fail)
+    # 2. Try to copy file to Drive grade folder (retry EVERY time, don't give up)
     output = st.session_state.output_folders
-    if output and st.session_state.file_sort_ok:
+    if output:
         dest_folder_id = output["grades"].get(GRADES[grade]["folder"])
         if dest_folder_id:
             try:
                 upload_to_grade_folder(file_id, dest_folder_id, fname, mime)
+                st.session_state.file_sort_ok = True
             except Exception as e:
-                st.session_state.file_sort_ok = False
-                st.toast(f"⚠️ File sort failed (Sheet still logged): {str(e)[:80]}",
-                         icon="⚠️")
+                st.toast(f"⚠️ File copy failed: {str(e)[:100]}", icon="⚠️")
 
-    # ── 3. Update local state
+    # 3. Update local state
     st.session_state.classifications[fname] = grade
     st.session_state.global_progress[fname] = {
         "annotator": st.session_state.annotator, "grade": grade}
