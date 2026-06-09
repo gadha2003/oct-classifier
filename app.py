@@ -528,15 +528,28 @@ with st.sidebar:
     st.markdown("")
     st.button("📂 Load images from Drive", on_click=load_images_from_drive,
               type="primary", use_container_width=True)
-    # Show output folder link (add this right after the Load button in sidebar)
+
+    # ── Output folder link (always visible once loaded) ───────────────────────
     if st.session_state.output_folders:
         root_id = st.session_state.output_folders["root"]
         st.markdown(
-            f'📁 [Open classified folder]'
-            f'(https://drive.google.com/drive/folders/{root_id})',
+            f'<div class="fade-in" style="margin-top:8px">'
+            f'📁 <a href="https://drive.google.com/drive/folders/{root_id}" '
+            f'target="_blank" style="color:#667eea;font-weight:600">'
+            f'Open classified folder ↗</a></div>',
             unsafe_allow_html=True)
 
-      
+    if st.session_state.loaded:
+        images = st.session_state.images
+        total = len(images)
+        gp = st.session_state.global_progress
+        my_done = len(st.session_state.classifications)
+        all_done = sum(1 for img in images if img["name"] in gp)
+        pending = total - all_done
+
+        st.markdown("---")
+
+        # ── Stats cards ───────────────────────────────────────────────────────
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(
@@ -552,21 +565,33 @@ with st.sidebar:
                 unsafe_allow_html=True)
         st.markdown("")
 
-        # File sorting status
+        # ── File sorting status ───────────────────────────────────────────────
         if st.session_state.output_folders and st.session_state.file_sort_ok:
             st.markdown(
-                '<div style="color:#4CAF50;font-size:12px">📁 Files sorting to Drive ✓</div>',
+                '<div style="color:#4CAF50;font-size:12px">'
+                '📁 Files sorting to Drive ✓</div>',
                 unsafe_allow_html=True)
         else:
             st.markdown(
-                '<div style="color:#999;font-size:12px">📊 Sheet-only mode</div>',
+                '<div style="color:#999;font-size:12px">'
+                '📊 Sheet-only mode (check folder permissions)</div>',
                 unsafe_allow_html=True)
 
+        # ── Pending count ─────────────────────────────────────────────────────
         if pending > 0:
             st.markdown(
-                f'<div style="color:#D85A30;font-weight:600">⏳ {pending} pending</div>',
+                f'<div style="color:#D85A30;font-weight:600;margin-top:4px">'
+                f'⏳ {pending} images still pending</div>',
+                unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="color:#4CAF50;font-weight:600;margin-top:4px">'
+                '✅ All images classified!</div>',
                 unsafe_allow_html=True)
 
+        st.markdown("")
+
+        # ── Per-grade counts (your classifications) ──────────────────────────
         counts = {"Mild": 0, "Moderate": 0, "Severe": 0}
         for g in st.session_state.classifications.values():
             if g in counts:
@@ -574,8 +599,18 @@ with st.sidebar:
         for name, g in GRADES.items():
             st.markdown(f'{g["emoji"]} **{name}**: {counts[name]}')
 
+        st.markdown("")
         st.button("⏭️ Jump to next pending", on_click=jump_next_pending,
                   use_container_width=True)
+
+        # ── Google Sheet link ─────────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown(
+            '<div style="font-size:12px">'
+            '📊 <a href="https://docs.google.com/spreadsheets" '
+            'target="_blank" style="color:#667eea">Open Google Sheets ↗</a>'
+            ' to see all responses</div>',
+            unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("**Grading reference**")
@@ -585,6 +620,7 @@ with st.sidebar:
             f'{g["emoji"]} <b style="color:{g["color"]}">{name}</b><br>'
             f'<span style="font-size:12px;color:#888">{g["desc"]}</span></div>',
             unsafe_allow_html=True)
+
     st.markdown("---")
     st.button("🚪 Switch annotator", on_click=logout, use_container_width=True)
 
