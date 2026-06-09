@@ -40,7 +40,6 @@ st.markdown("""
     display: inline-block; padding: 4px 14px; border-radius: 20px;
     background: linear-gradient(135deg, #667eea, #764ba2);
     color: white; font-weight: 600; font-size: 14px;
-    animation: slideRight 0.5s ease-out;
 }
 div.stButton > button:hover {
     box-shadow: 0 4px 15px rgba(0,0,0,0.15);
@@ -129,7 +128,111 @@ def download_image_bytes(file_id):
     buf.seek(0)
     return buf
 
-# ─── GOOGLE SHEET HELPERS (replaces local CSV + cache + global progress) ──────
+# ─── OUTPUT FOLDER MANAGEMENT (service account owns these → no permission issues)
+def find_sa_folder(name, parent_id=None):
+    """Find a folder by name owned by service account."""
+    drive = get_drive()
+    q = (f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
+         f"and trashed=false")
+    if parent_id:
+        q += f" and '{parent_id}' in parents"
+    results = drive.files().list(q=q, fields="files(id)", pageSize=5).execute()
+    files = results.get("files", [])
+    return files[0]["id"] if files else None
+
+def create_sa_folder(name, parent_id=None):
+    """Create a folder owned by service account."""
+    drive = get_drive()
+    meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        meta["parents"] = [parent_id]
+    folder = drive.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+def share_folder_with_anyone(folder_id):
+    """Make folder viewable by anyone with link so user can access it."""
+    drive = get_drive()
+    try:
+        drive.permissions().create(
+            fileId=folder_id,
+            body={"type": "anyone", "role": "writer"},
+            fields="id",
+        ).execute()
+    except Exception:
+        try:
+            drive.permissions().create(
+                fileId=folder_id,
+                body={"type": "anyone", "role": "reader"},
+                fields="id",
+            ).execute()
+        except Exception:
+            pass  # Not critical
+
+@st.cache_data(ttl=300)
+def setup_output_folders():
+    """
+    Create the output folder structure owned by the service account:
+    OCT_Classified_Output/
+      Grade1_Mild/
+      Grade2_Moderate/
+      Grade3_Severe/
+    Returns: {grade_folder_name: folder_id} or None if failed.
+    """
+    try:
+        root_name = "OCT_Classified_Output"
+        root_id = find_sa_folder(root_name)
+        if not root_id:
+            root_id = create_sa_folder(root_name)
+            share_folder_with_anyone(root_id)
+
+        grade_ids = {}
+        for g in GRADES.values():
+            fid = find_sa_folder(g["folder"], root_id)
+            if not fid:
+                fid = create_sa_folder(g["folder"], root_id)
+            grade_ids[g["folder"]] = fid
+
+        return {"root": root_id, "grades": grade_ids}
+    except Exception as e:
+        st.toast(f"⚠️ Could not create output folders: {e}", icon="⚠️")
+        return None
+
+def upload_to_grade_folder(source_file_id, dest_folder_id, filename, mime="image/jpeg"):
+    """Download from source, upload to grade folder. Service account owns dest."""
+    drive = get_drive()
+    # Download
+    request = drive.files().get_media(fileId=source_file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+
+    # Check if file already exists in dest (avoid duplicates)
+    q = f"'{dest_folder_id}' in parents and name='{filename}' and trashed=false"
+    existing = drive.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if existing:
+        return existing[0]["id"]
+
+    # Upload (non-resumable for small files — more reliable)
+    media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
+    result = drive.files().create(
+        body={"name": filename, "parents": [dest_folder_id]},
+        media_body=media,
+        fields="id",
+    ).execute()
+    return result["id"]
+
+def remove_from_grade_folder(dest_folder_id, filename):
+    """Remove a classified image from a grade folder."""
+    drive = get_drive()
+    q = f"'{dest_folder_id}' in parents and name='{filename}' and trashed=false"
+    results = drive.files().list(q=q, fields="files(id)").execute()
+    for f in results.get("files", []):
+        drive.files().delete(fileId=f["id"]).execute()
+
+# ─── GOOGLE SHEET HELPERS ─────────────────────────────────────────────────────
 def ensure_sheet_headers():
     sheet = get_sheet()
     try:
@@ -140,7 +243,6 @@ def ensure_sheet_headers():
         sheet.insert_row(SHEET_HEADERS, index=1)
 
 def load_global_progress():
-    """Read Sheet → { filename: {"annotator":..., "grade":...} }"""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
@@ -175,7 +277,6 @@ def remove_from_sheet(filename, annotator):
         pass
 
 def get_annotator_history(annotator):
-    """Get this annotator's past classifications from the Sheet."""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
@@ -188,24 +289,24 @@ def get_annotator_history(annotator):
     return classifications, len(classifications)
 
 def get_all_annotator_names():
-    """Get list of all annotators who have entries in the Sheet."""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
     except Exception:
-        return []
+        return {}
     names = {}
     for r in records:
         a = r.get("annotator", "")
         if a:
             names[a] = names.get(a, 0) + 1
-    return names  # {name: count}
+    return names
 
 # ─── SESSION STATE ────────────────────────────────────────────────────────────
 defaults = {
     "images": [], "idx": 0, "classifications": {},
     "loaded": False, "annotator": "", "logged_in": False,
     "just_classified": None, "global_progress": {},
+    "output_folders": None, "file_sort_ok": True,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -221,23 +322,24 @@ def do_login():
 def load_images_from_drive():
     src_id = st.secrets["SOURCE_FOLDER_ID"]
 
-    with st.spinner("Loading images from Google Drive..."):
+    with st.spinner("Loading images from Drive..."):
         images = list_drive_images(src_id)
     if not images:
-        st.toast("❌ No images found in Drive folder!", icon="🚫")
+        st.toast("❌ No images found!", icon="🚫")
         return
 
     ensure_sheet_headers()
     gp = load_global_progress()
-
-    # Restore this annotator's previous work from Sheet
     my_prev, _ = get_annotator_history(st.session_state.annotator)
+
+    # Setup output folders (service account creates & owns them)
+    output = setup_output_folders()
+    st.session_state.output_folders = output
 
     st.session_state.images = images
     st.session_state.global_progress = gp
     st.session_state.classifications = my_prev
 
-    # Auto-jump to first unclassified image
     classified_set = set(gp.keys())
     first_pending = 0
     for i, img in enumerate(images):
@@ -247,23 +349,46 @@ def load_images_from_drive():
     st.session_state.idx = first_pending
     st.session_state.loaded = True
 
+    folders_ok = "✅ files will be sorted" if output else "📊 Sheet-only mode"
     already = len(classified_set & {f["name"] for f in images})
-    st.toast(f"✅ {len(images)} images · {already} already done", icon="🎉")
+    st.toast(f"✅ {len(images)} images · {already} done · {folders_ok}", icon="🎉")
 
 def classify(grade):
     img = st.session_state.images[st.session_state.idx]
     fname = img["name"]
     file_id = img["id"]
+    mime = img.get("mime", "image/jpeg")
 
-    # If re-classifying, remove old entry from Sheet
+    # ── Remove old classification if re-labeling
     old = st.session_state.classifications.get(fname)
     if old and old != grade:
         remove_from_sheet(fname, st.session_state.annotator)
+        # Try removing old file from Drive grade folder
+        output = st.session_state.output_folders
+        if output:
+            old_folder_id = output["grades"].get(GRADES[old]["folder"])
+            if old_folder_id:
+                try:
+                    remove_from_grade_folder(old_folder_id, fname)
+                except Exception:
+                    pass
 
-    # Log to Google Sheet (source of truth — like Google Forms)
+    # ── 1. Always log to Sheet (source of truth — never fails)
     append_to_sheet(st.session_state.annotator, fname, grade, file_id)
 
-    # Update local state
+    # ── 2. Try to copy file to grade folder on Drive (bonus — may fail)
+    output = st.session_state.output_folders
+    if output and st.session_state.file_sort_ok:
+        dest_folder_id = output["grades"].get(GRADES[grade]["folder"])
+        if dest_folder_id:
+            try:
+                upload_to_grade_folder(file_id, dest_folder_id, fname, mime)
+            except Exception as e:
+                st.session_state.file_sort_ok = False
+                st.toast(f"⚠️ File sort failed (Sheet still logged): {str(e)[:80]}",
+                         icon="⚠️")
+
+    # ── 3. Update local state
     st.session_state.classifications[fname] = grade
     st.session_state.global_progress[fname] = {
         "annotator": st.session_state.annotator, "grade": grade}
@@ -274,8 +399,7 @@ def classify(grade):
 def advance_to_next_pending():
     images = st.session_state.images
     gp = st.session_state.global_progress
-    start = st.session_state.idx + 1
-    for i in range(start, len(images)):
+    for i in range(st.session_state.idx + 1, len(images)):
         if images[i]["name"] not in gp:
             st.session_state.idx = i
             return
@@ -288,6 +412,15 @@ def clear_current():
     grade = st.session_state.classifications.pop(fname, None)
     if grade:
         remove_from_sheet(fname, st.session_state.annotator)
+        # Try removing from Drive
+        output = st.session_state.output_folders
+        if output:
+            folder_id = output["grades"].get(GRADES[grade]["folder"])
+            if folder_id:
+                try:
+                    remove_from_grade_folder(folder_id, fname)
+                except Exception:
+                    pass
         gp = st.session_state.global_progress.get(fname)
         if gp and gp["annotator"] == st.session_state.annotator:
             del st.session_state.global_progress[fname]
@@ -337,13 +470,11 @@ if not st.session_state.logged_in:
                   use_container_width=True)
 
     st.markdown("---")
-
-    # Show previous annotators from Sheet
     try:
-        prev_annotators = get_all_annotator_names()
-        if prev_annotators:
+        prev = get_all_annotator_names()
+        if prev:
             st.markdown("**Previous annotators**")
-            for name, count in prev_annotators.items():
+            for name, count in prev.items():
                 st.markdown(
                     f'<div class="grade-card" style="border-left:4px solid #667eea;">'
                     f'👤 <b>{name}</b> — {count} images classified</div>',
@@ -373,13 +504,12 @@ if st.session_state.logged_in and not st.session_state.loaded:
                 f'<div style="font-size:1.3rem;font-weight:600">Welcome back, '
                 f'{st.session_state.annotator}!</div>'
                 f'<div style="color:#888;margin-top:8px">'
-                f'You have {my_count} previous classifications on record.</div></div>',
+                f'{my_count} previous classifications found.</div></div>',
                 unsafe_allow_html=True)
             st.markdown("")
             r1, r2 = st.columns(2)
             with r1:
-                if st.button("▶️ Resume (load from Sheet)", type="primary",
-                             use_container_width=True):
+                if st.button("▶️ Resume", type="primary", use_container_width=True):
                     st.session_state.resume_answered = True
                     load_images_from_drive()
                     st.rerun()
@@ -411,28 +541,34 @@ with st.sidebar:
         pending = total - all_done
 
         st.markdown("---")
-        st.markdown(
-            f'<div class="stat-card">'
-            f'<div class="stat-num">{all_done}/{total}</div>'
-            f'<div class="stat-label">total classified (all annotators)</div></div>',
-            unsafe_allow_html=True)
-        st.markdown("")
-        st.markdown(
-            f'<div class="stat-card" style="background:linear-gradient(145deg,#eef,#e0e0ff)">'
-            f'<div class="stat-num" style="color:#667eea">{my_done}</div>'
-            f'<div class="stat-label">classified by you</div></div>',
-            unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown(
+                f'<div class="stat-card">'
+                f'<div class="stat-num">{all_done}/{total}</div>'
+                f'<div class="stat-label">total done</div></div>',
+                unsafe_allow_html=True)
+        with c2:
+            st.markdown(
+                f'<div class="stat-card" style="background:linear-gradient(145deg,#eef,#e0e0ff)">'
+                f'<div class="stat-num" style="color:#667eea">{my_done}</div>'
+                f'<div class="stat-label">by you</div></div>',
+                unsafe_allow_html=True)
         st.markdown("")
 
-        if pending > 0:
+        # File sorting status
+        if st.session_state.output_folders and st.session_state.file_sort_ok:
             st.markdown(
-                f'<div class="fade-in" style="color:#D85A30;font-weight:600">'
-                f'⏳ {pending} images still pending</div>',
+                '<div style="color:#4CAF50;font-size:12px">📁 Files sorting to Drive ✓</div>',
                 unsafe_allow_html=True)
         else:
             st.markdown(
-                '<div class="fade-in" style="color:#4CAF50;font-weight:600">'
-                '✅ All images classified!</div>',
+                '<div style="color:#999;font-size:12px">📊 Sheet-only mode</div>',
+                unsafe_allow_html=True)
+
+        if pending > 0:
+            st.markdown(
+                f'<div style="color:#D85A30;font-weight:600">⏳ {pending} pending</div>',
                 unsafe_allow_html=True)
 
         counts = {"Mild": 0, "Moderate": 0, "Severe": 0}
@@ -453,7 +589,6 @@ with st.sidebar:
             f'{g["emoji"]} <b style="color:{g["color"]}">{name}</b><br>'
             f'<span style="font-size:12px;color:#888">{g["desc"]}</span></div>',
             unsafe_allow_html=True)
-
     st.markdown("---")
     st.button("🚪 Switch annotator", on_click=logout, use_container_width=True)
 
@@ -465,7 +600,7 @@ st.markdown(
     '🔬 Classify OCT Images</div>', unsafe_allow_html=True)
 
 if not st.session_state.loaded:
-    st.info("👈 Click **Load images from Drive** in the sidebar to begin.")
+    st.info("👈 Click **Load images from Drive** in the sidebar.")
     st.stop()
 
 images = st.session_state.images
@@ -489,7 +624,7 @@ if st.session_state.just_classified:
     st.session_state.just_classified = None
 
 all_done = sum(1 for img in images if img["name"] in gp)
-st.progress(all_done / total, text=f"Global: {all_done}/{total} classified")
+st.progress(all_done / total, text=f"Global: {all_done}/{total}")
 
 st.markdown(
     f'<div class="fade-in">'
@@ -504,24 +639,22 @@ if my_grade:
         f'<div class="slide-in pulse" style="display:inline-block;'
         f'background:{c}15;border:1.5px solid {c};border-radius:10px;'
         f'padding:6px 16px;color:{c};font-weight:600;margin:8px 0">'
-        f'{e} You labeled this: {my_grade}</div>',
-        unsafe_allow_html=True)
+        f'{e} You labeled: {my_grade}</div>', unsafe_allow_html=True)
 elif other_info:
-    oi_grade = other_info.get("grade", "")
-    oi_emoji = GRADES.get(oi_grade, {}).get("emoji", "")
+    oi = other_info.get("grade","")
+    oe = GRADES.get(oi,{}).get("emoji","")
     st.markdown(
         f'<div class="slide-in" style="display:inline-block;'
         f'background:#667eea20;border:1.5px solid #667eea;border-radius:10px;'
         f'padding:6px 16px;color:#667eea;font-weight:600;margin:8px 0">'
-        f'👤 Classified by {other_info["annotator"]} as {oi_emoji} {oi_grade}'
-        f'</div>', unsafe_allow_html=True)
+        f'👤 {other_info["annotator"]} → {oe} {oi}</div>',
+        unsafe_allow_html=True)
 else:
     st.markdown(
         '<div class="fade-in" style="display:inline-block;'
         'background:#f0f2f6;border:1.5px dashed #ccc;border-radius:10px;'
         'padding:6px 16px;color:#999;margin:8px 0">'
-        '⬜ Not yet classified by anyone</div>',
-        unsafe_allow_html=True)
+        '⬜ Not yet classified</div>', unsafe_allow_html=True)
 
 try:
     with st.spinner(""):
@@ -566,19 +699,17 @@ with n4:
 
 if all_done == total and total > 0:
     st.balloons()
-    st.markdown("---")
     st.markdown(
         '<div class="fade-in" style="text-align:center;padding:20px">'
         '<div style="font-size:2.5rem">🎉</div>'
         '<div style="font-size:1.3rem;font-weight:700;color:#4CAF50">'
-        'All images classified!</div></div>',
-        unsafe_allow_html=True)
+        'All images classified!</div></div>', unsafe_allow_html=True)
 
     annotator_counts = {}
     for f, info in gp.items():
         a = info["annotator"]
         if a not in annotator_counts:
-            annotator_counts[a] = {"Mild": 0, "Moderate": 0, "Severe": 0, "total": 0}
+            annotator_counts[a] = {"Mild":0,"Moderate":0,"Severe":0,"total":0}
         if info["grade"] in annotator_counts[a]:
             annotator_counts[a][info["grade"]] += 1
         annotator_counts[a]["total"] += 1
@@ -591,4 +722,13 @@ if all_done == total and total > 0:
             f'(🟡{c["Mild"]} 🟠{c["Moderate"]} 🔴{c["Severe"]})</div>',
             unsafe_allow_html=True)
 
-    st.success("📊 Open your Google Sheet to see all responses!")
+    # Show output folder link if available
+    output = st.session_state.output_folders
+    if output:
+        root_id = output["root"]
+        st.success(
+            f'📁 Classified files: '
+            f'[Open in Drive](https://drive.google.com/drive/folders/{root_id})\n\n'
+            f'📊 Full log: Open your Google Sheet')
+    else:
+        st.success("📊 All responses logged in Google Sheet!")
