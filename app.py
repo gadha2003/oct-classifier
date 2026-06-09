@@ -327,10 +327,7 @@ def load_images_from_drive():
     if not images:
         st.toast("❌ No images found!", icon="🚫")
         return
-
-    ensure_sheet_headers()
-    gp = load_global_progress()
-    my_prev, _ = get_annotator_history(st.session_state.annotator)
+    
 
     # Setup output folders (service account creates & owns them)
     output = setup_output_folders()
@@ -532,15 +529,12 @@ with st.sidebar:
     st.button("📂 Load images from Drive", on_click=load_images_from_drive,
               type="primary", use_container_width=True)
 
-    if st.session_state.loaded:
-        images = st.session_state.images
-        total = len(images)
-        gp = st.session_state.global_progress
-        my_done = len(st.session_state.classifications)
-        all_done = sum(1 for img in images if img["name"] in gp)
-        pending = total - all_done
-
-        st.markdown("---")
+      if st.session_state.output_folders:
+        root_id = st.session_state.output_folders["root"]
+        st.markdown(
+            f'📁 [Open classified folder]'
+            f'(https://drive.google.com/drive/folders/{root_id})',
+            unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(
