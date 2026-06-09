@@ -327,12 +327,25 @@ def load_images_from_drive():
     if not images:
         st.toast("❌ No images found!", icon="🚫")
         return
-    
 
-    # Setup output folders (service account creates & owns them)
-    output = setup_output_folders()
+    ensure_sheet_headers()
+
+    try:
+        gp = load_global_progress()
+    except Exception:
+        gp = {}
+
+    try:
+        my_prev, _ = get_annotator_history(st.session_state.annotator)
+    except Exception:
+        my_prev = {}
+
+    try:
+        output = setup_output_folders()
+    except Exception:
+        output = None
+
     st.session_state.output_folders = output
-
     st.session_state.images = images
     st.session_state.global_progress = gp
     st.session_state.classifications = my_prev
@@ -346,10 +359,10 @@ def load_images_from_drive():
     st.session_state.idx = first_pending
     st.session_state.loaded = True
 
-    folders_ok = "✅ files will be sorted" if output else "📊 Sheet-only mode"
     already = len(classified_set & {f["name"] for f in images})
+    folders_ok = "files sorted" if output else "sheet-only"
     st.toast(f"✅ {len(images)} images · {already} done · {folders_ok}", icon="🎉")
-
+    
 def classify(grade):
     img = st.session_state.images[st.session_state.idx]
     fname = img["name"]
