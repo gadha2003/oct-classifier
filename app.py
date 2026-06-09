@@ -133,11 +133,22 @@ def download_image_bytes(file_id):
     return buf
 
 def copy_to_drive_folder(file_id, dest_folder_id, filename):
-    """Copy a file into a destination Drive folder."""
+    """Download image then upload to destination folder (more reliable than copy)."""
     drive = get_drive()
-    drive.files().copy(
-        fileId=file_id,
+    # Download
+    request = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    # Upload to destination
+    media = MediaIoBaseUpload(buf, mimetype="image/jpeg", resumable=True)
+    drive.files().create(
         body={"name": filename, "parents": [dest_folder_id]},
+        media_body=media,
+        fields="id",
     ).execute()
 
 def find_subfolder_id(parent_id, subfolder_name):
@@ -162,6 +173,16 @@ def remove_from_drive_folder(folder_id, filename):
     results = drive.files().list(q=q, fields="files(id)").execute()
     for f in results.get("files", []):
         drive.files().delete(fileId=f["id"]).execute()
+def remove_from_drive_folder(folder_id, filename):
+    """Delete a file by name from a specific folder."""
+    try:
+        drive = get_drive()
+        q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+        results = drive.files().list(q=q, fields="files(id)").execute()
+        for f in results.get("files", []):
+            drive.files().delete(fileId=f["id"]).execute()
+    except Exception as e:
+        st.toast(f"Could not remove file: {e}", icon="⚠️")        
 
 # ─── GOOGLE SHEET HELPERS (the "Forms" log) ──────────────────────────────────
 SHEET_HEADERS = ["timestamp", "annotator", "image", "grade", "drive_file_id"]
