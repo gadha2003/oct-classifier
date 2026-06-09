@@ -528,13 +528,15 @@ with st.sidebar:
     st.markdown("")
     st.button("📂 Load images from Drive", on_click=load_images_from_drive,
               type="primary", use_container_width=True)
-
-      if st.session_state.output_folders:
+    # Show output folder link (add this right after the Load button in sidebar)
+    if st.session_state.output_folders:
         root_id = st.session_state.output_folders["root"]
         st.markdown(
             f'📁 [Open classified folder]'
             f'(https://drive.google.com/drive/folders/{root_id})',
             unsafe_allow_html=True)
+
+      
         c1, c2 = st.columns(2)
         with c1:
             st.markdown(
