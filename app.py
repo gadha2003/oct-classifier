@@ -166,13 +166,7 @@ def find_subfolder_id(parent_id, subfolder_name):
     folder = drive.files().create(body=meta, fields="id").execute()
     return folder["id"]
 
-def remove_from_drive_folder(folder_id, filename):
-    """Delete a file by name from a specific folder."""
-    drive = get_drive()
-    q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
-    results = drive.files().list(q=q, fields="files(id)").execute()
-    for f in results.get("files", []):
-        drive.files().delete(fileId=f["id"]).execute()
+
 def remove_from_drive_folder(folder_id, filename):
     """Delete a file by name from a specific folder."""
     try:
