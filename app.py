@@ -6,7 +6,7 @@ from datetime import datetime
 from PIL import Image
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 # ─── PAGE CONFIG ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="DME OCT Classifier", page_icon="🔬", layout="centered")
@@ -40,7 +40,6 @@ st.markdown("""
     display: inline-block; padding: 4px 14px; border-radius: 20px;
     background: linear-gradient(135deg, #667eea, #764ba2);
     color: white; font-weight: 600; font-size: 14px;
-    animation: slideRight 0.5s ease-out;
 }
 div.stButton > button:hover {
     box-shadow: 0 4px 15px rgba(0,0,0,0.15);
@@ -78,7 +77,7 @@ SHEET_HEADERS = ["timestamp", "annotator", "image", "grade", "drive_file_id"]
 
 # ─── GOOGLE API ───────────────────────────────────────────────────────────────
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
@@ -129,7 +128,7 @@ def download_image_bytes(file_id):
     buf.seek(0)
     return buf
 
-# ─── GOOGLE SHEET HELPERS (replaces local CSV + cache + global progress) ──────
+# ─── SHEET HELPERS ────────────────────────────────────────────────────────────
 def ensure_sheet_headers():
     sheet = get_sheet()
     try:
@@ -139,73 +138,96 @@ def ensure_sheet_headers():
     except Exception:
         sheet.insert_row(SHEET_HEADERS, index=1)
 
-def load_global_progress():
-    """Read Sheet → { filename: {"annotator":..., "grade":...} }"""
+def load_my_classifications(annotator):
+    """Load ONLY this annotator's classifications. {filename: grade}"""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
     except Exception:
         return {}
-    progress = {}
+    my = {}
     for r in records:
-        fname = r.get("image", "")
-        if fname:
-            progress[fname] = {
-                "annotator": r.get("annotator", ""),
-                "grade":     r.get("grade", ""),
-            }
-    return progress
+        if r.get("annotator") == annotator:
+            my[r.get("image", "")] = r.get("grade", "")
+    return my
+
+def load_other_annotations(annotator):
+    """Load what OTHER annotators labeled (for comparison display only)."""
+    sheet = get_sheet()
+    try:
+        records = sheet.get_all_records()
+    except Exception:
+        return {}
+    others = {}  # {filename: [{annotator, grade}, ...]}
+    for r in records:
+        a = r.get("annotator", "")
+        if a and a != annotator:
+            fname = r.get("image", "")
+            if fname not in others:
+                others[fname] = []
+            others[fname].append({"annotator": a, "grade": r.get("grade", "")})
+    return others
 
 def append_to_sheet(annotator, filename, grade, file_id):
+    """Add a row. Unique key = (annotator, image)."""
     sheet = get_sheet()
     sheet.append_row([
         datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         annotator, filename, grade, file_id,
     ])
 
-def remove_from_sheet(filename, annotator):
+def update_or_append(annotator, filename, grade, file_id):
+    """If (annotator, image) exists, update grade. Otherwise append."""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
         for i, r in enumerate(records):
-            if r.get("image") == filename and r.get("annotator") == annotator:
+            if r.get("annotator") == annotator and r.get("image") == filename:
+                row_num = i + 2  # 1-indexed + header
+                sheet.update_cell(row_num, 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                sheet.update_cell(row_num, 4, grade)
+                return
+    except Exception:
+        pass
+    append_to_sheet(annotator, filename, grade, file_id)
+
+def remove_from_sheet(annotator, filename):
+    """Remove the row for this (annotator, image) pair."""
+    sheet = get_sheet()
+    try:
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if r.get("annotator") == annotator and r.get("image") == filename:
                 sheet.delete_rows(i + 2)
                 return
     except Exception:
         pass
 
-def get_annotator_history(annotator):
-    """Get this annotator's past classifications from the Sheet."""
+def get_all_annotator_stats():
+    """Get all annotators + their counts for the login screen."""
     sheet = get_sheet()
     try:
         records = sheet.get_all_records()
     except Exception:
-        return {}, 0
-    classifications = {}
-    for r in records:
-        if r.get("annotator") == annotator:
-            classifications[r.get("image", "")] = r.get("grade", "")
-    return classifications, len(classifications)
-
-def get_all_annotator_names():
-    """Get list of all annotators who have entries in the Sheet."""
-    sheet = get_sheet()
-    try:
-        records = sheet.get_all_records()
-    except Exception:
-        return []
-    names = {}
+        return {}
+    stats = {}
     for r in records:
         a = r.get("annotator", "")
         if a:
-            names[a] = names.get(a, 0) + 1
-    return names  # {name: count}
+            if a not in stats:
+                stats[a] = {"total": 0, "Mild": 0, "Moderate": 0, "Severe": 0}
+            stats[a]["total"] += 1
+            g = r.get("grade", "")
+            if g in stats[a]:
+                stats[a][g] += 1
+    return stats
 
 # ─── SESSION STATE ────────────────────────────────────────────────────────────
 defaults = {
     "images": [], "idx": 0, "classifications": {},
+    "other_annotations": {},
     "loaded": False, "annotator": "", "logged_in": False,
-    "just_classified": None, "global_progress": {},
+    "just_classified": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -221,64 +243,70 @@ def do_login():
 def load_images_from_drive():
     src_id = st.secrets["SOURCE_FOLDER_ID"]
 
-    with st.spinner("Loading images from Google Drive..."):
+    with st.spinner("Loading images from Drive..."):
         images = list_drive_images(src_id)
     if not images:
-        st.toast("❌ No images found in Drive folder!", icon="🚫")
+        st.toast("❌ No images found!", icon="🚫")
         return
 
     ensure_sheet_headers()
-    gp = load_global_progress()
 
-    # Restore this annotator's previous work from Sheet
-    my_prev, _ = get_annotator_history(st.session_state.annotator)
+    try:
+        my_prev = load_my_classifications(st.session_state.annotator)
+    except Exception:
+        my_prev = {}
+
+    try:
+        others = load_other_annotations(st.session_state.annotator)
+    except Exception:
+        others = {}
 
     st.session_state.images = images
-    st.session_state.global_progress = gp
     st.session_state.classifications = my_prev
+    st.session_state.other_annotations = others
 
-    # Auto-jump to first unclassified image
-    classified_set = set(gp.keys())
+    # Auto-jump to first image THIS annotator hasn't done yet
     first_pending = 0
     for i, img in enumerate(images):
-        if img["name"] not in classified_set:
+        if img["name"] not in my_prev:
             first_pending = i
             break
+    else:
+        first_pending = len(images) - 1  # all done, go to last
+
     st.session_state.idx = first_pending
     st.session_state.loaded = True
 
-    already = len(classified_set & {f["name"] for f in images})
-    st.toast(f"✅ {len(images)} images · {already} already done", icon="🎉")
+    st.toast(
+        f"✅ {len(images)} images · you've done {len(my_prev)} · "
+        f"{len(images) - len(my_prev)} remaining",
+        icon="🎉")
 
 def classify(grade):
     img = st.session_state.images[st.session_state.idx]
     fname = img["name"]
     file_id = img["id"]
+    annotator = st.session_state.annotator
 
-    # If re-classifying, remove old entry from Sheet
-    old = st.session_state.classifications.get(fname)
-    if old and old != grade:
-        remove_from_sheet(fname, st.session_state.annotator)
-
-    # Log to Google Sheet (source of truth — like Google Forms)
-    append_to_sheet(st.session_state.annotator, fname, grade, file_id)
+    # Update or append to Sheet (annotator + image = unique key)
+    update_or_append(annotator, fname, grade, file_id)
 
     # Update local state
     st.session_state.classifications[fname] = grade
-    st.session_state.global_progress[fname] = {
-        "annotator": st.session_state.annotator, "grade": grade}
     st.session_state.just_classified = grade
 
-    advance_to_next_pending()
+    # Auto-advance to next image THIS annotator hasn't done
+    advance_to_my_next()
 
-def advance_to_next_pending():
+def advance_to_my_next():
+    """Jump to the next image THIS annotator hasn't classified."""
     images = st.session_state.images
-    gp = st.session_state.global_progress
-    start = st.session_state.idx + 1
-    for i in range(start, len(images)):
-        if images[i]["name"] not in gp:
+    my = st.session_state.classifications
+    for i in range(st.session_state.idx + 1, len(images)):
+        if images[i]["name"] not in my:
             st.session_state.idx = i
             return
+    # All remaining done — just go to next image
     if st.session_state.idx < len(images) - 1:
         st.session_state.idx += 1
 
@@ -287,10 +315,7 @@ def clear_current():
     fname = img["name"]
     grade = st.session_state.classifications.pop(fname, None)
     if grade:
-        remove_from_sheet(fname, st.session_state.annotator)
-        gp = st.session_state.global_progress.get(fname)
-        if gp and gp["annotator"] == st.session_state.annotator:
-            del st.session_state.global_progress[fname]
+        remove_from_sheet(st.session_state.annotator, fname)
     st.session_state.just_classified = None
 
 def go_prev():
@@ -303,14 +328,20 @@ def go_next():
         st.session_state.idx += 1
     st.session_state.just_classified = None
 
-def jump_next_pending():
+def jump_my_next_pending():
+    """Skip to next image THIS annotator hasn't done."""
     images = st.session_state.images
-    gp = st.session_state.global_progress
+    my = st.session_state.classifications
     for i in range(st.session_state.idx + 1, len(images)):
-        if images[i]["name"] not in gp:
+        if images[i]["name"] not in my:
             st.session_state.idx = i
             return
-    st.toast("🎉 No more pending images!", icon="✅")
+    # Wrap around from beginning
+    for i in range(0, st.session_state.idx):
+        if images[i]["name"] not in my:
+            st.session_state.idx = i
+            return
+    st.toast("🎉 You've classified all images!", icon="✅")
 
 def logout():
     for k in defaults:
@@ -324,13 +355,17 @@ if not st.session_state.logged_in:
     st.markdown('<p class="welcome-title">🔬 DME OCT Classifier</p>',
                 unsafe_allow_html=True)
     st.markdown(
-        '<div class="fade-in" style="font-size:1.05rem;color:#666;margin-bottom:32px">'
-        'Manual severity grading · relay mode · resume anytime</div>',
+        '<div class="fade-in" style="font-size:1.05rem;color:#666;margin-bottom:8px">'
+        'Manual severity grading for inter-rater agreement</div>',
+        unsafe_allow_html=True)
+    st.markdown(
+        '<div class="fade-in" style="font-size:0.85rem;color:#999;margin-bottom:32px">'
+        'Each annotator classifies the full set independently · resume anytime</div>',
         unsafe_allow_html=True)
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        st.text_input("Enter your name to begin", key="name_input",
+        st.text_input("Enter your name", key="name_input",
                       placeholder="e.g. Gadha Suresh", label_visibility="collapsed")
     with col2:
         st.button("Start →", on_click=do_login, type="primary",
@@ -338,15 +373,16 @@ if not st.session_state.logged_in:
 
     st.markdown("---")
 
-    # Show previous annotators from Sheet
+    # Show all annotators and their progress
     try:
-        prev_annotators = get_all_annotator_names()
-        if prev_annotators:
-            st.markdown("**Previous annotators**")
-            for name, count in prev_annotators.items():
+        all_stats = get_all_annotator_stats()
+        if all_stats:
+            st.markdown("**Annotator progress**")
+            for name, s in all_stats.items():
                 st.markdown(
                     f'<div class="grade-card" style="border-left:4px solid #667eea;">'
-                    f'👤 <b>{name}</b> — {count} images classified</div>',
+                    f'👤 <b>{name}</b> — {s["total"]} done '
+                    f'(🟡{s["Mild"]} 🟠{s["Moderate"]} 🔴{s["Severe"]})</div>',
                     unsafe_allow_html=True)
     except Exception:
         pass
@@ -366,25 +402,25 @@ if not st.session_state.logged_in:
 # ══════════════════════════════════════════════════════════════════════════════
 if st.session_state.logged_in and not st.session_state.loaded:
     try:
-        my_prev, my_count = get_annotator_history(st.session_state.annotator)
-        if my_count > 0 and "resume_answered" not in st.session_state:
+        my_prev = load_my_classifications(st.session_state.annotator)
+        if len(my_prev) > 0 and "resume_answered" not in st.session_state:
             st.markdown(
                 f'<div class="fade-in" style="text-align:center;padding:20px">'
                 f'<div style="font-size:1.3rem;font-weight:600">Welcome back, '
                 f'{st.session_state.annotator}!</div>'
                 f'<div style="color:#888;margin-top:8px">'
-                f'You have {my_count} previous classifications on record.</div></div>',
+                f'You have {len(my_prev)} classifications saved. '
+                f'You\'ll continue from where you left off.</div></div>',
                 unsafe_allow_html=True)
             st.markdown("")
             r1, r2 = st.columns(2)
             with r1:
-                if st.button("▶️ Resume (load from Sheet)", type="primary",
-                             use_container_width=True):
+                if st.button("▶️ Resume", type="primary", use_container_width=True):
                     st.session_state.resume_answered = True
                     load_images_from_drive()
                     st.rerun()
             with r2:
-                if st.button("🆕 Start fresh", use_container_width=True):
+                if st.button("🆕 Start from image 1", use_container_width=True):
                     st.session_state.resume_answered = True
                     st.rerun()
             st.stop()
@@ -405,36 +441,33 @@ with st.sidebar:
     if st.session_state.loaded:
         images = st.session_state.images
         total = len(images)
-        gp = st.session_state.global_progress
         my_done = len(st.session_state.classifications)
-        all_done = sum(1 for img in images if img["name"] in gp)
-        pending = total - all_done
+        my_pending = total - my_done
 
         st.markdown("---")
+
+        # Your progress
         st.markdown(
             f'<div class="stat-card">'
-            f'<div class="stat-num">{all_done}/{total}</div>'
-            f'<div class="stat-label">total classified (all annotators)</div></div>',
-            unsafe_allow_html=True)
-        st.markdown("")
-        st.markdown(
-            f'<div class="stat-card" style="background:linear-gradient(145deg,#eef,#e0e0ff)">'
-            f'<div class="stat-num" style="color:#667eea">{my_done}</div>'
-            f'<div class="stat-label">classified by you</div></div>',
+            f'<div class="stat-num">{my_done}/{total}</div>'
+            f'<div class="stat-label">your progress</div></div>',
             unsafe_allow_html=True)
         st.markdown("")
 
-        if pending > 0:
+        if my_pending > 0:
             st.markdown(
-                f'<div class="fade-in" style="color:#D85A30;font-weight:600">'
-                f'⏳ {pending} images still pending</div>',
+                f'<div style="color:#D85A30;font-weight:600">'
+                f'⏳ {my_pending} images remaining</div>',
                 unsafe_allow_html=True)
         else:
             st.markdown(
-                '<div class="fade-in" style="color:#4CAF50;font-weight:600">'
-                '✅ All images classified!</div>',
+                '<div style="color:#4CAF50;font-weight:600">'
+                '✅ You\'ve classified all images!</div>',
                 unsafe_allow_html=True)
 
+        st.markdown("")
+
+        # Your grade distribution
         counts = {"Mild": 0, "Moderate": 0, "Severe": 0}
         for g in st.session_state.classifications.values():
             if g in counts:
@@ -442,8 +475,18 @@ with st.sidebar:
         for name, g in GRADES.items():
             st.markdown(f'{g["emoji"]} **{name}**: {counts[name]}')
 
-        st.button("⏭️ Jump to next pending", on_click=jump_next_pending,
-                  use_container_width=True)
+        st.markdown("")
+        st.button("⏭️ Jump to next pending", on_click=jump_my_next_pending,
+                  use_container_width=True, disabled=(my_pending == 0))
+
+        # Sheet link
+        st.markdown("---")
+        st.markdown(
+            '<div style="font-size:12px">'
+            '📊 <a href="https://docs.google.com/spreadsheets" '
+            'target="_blank" style="color:#667eea">Open Google Sheets ↗</a>'
+            ' — all annotators\' responses</div>',
+            unsafe_allow_html=True)
 
     st.markdown("---")
     st.markdown("**Grading reference**")
@@ -453,7 +496,6 @@ with st.sidebar:
             f'{g["emoji"]} <b style="color:{g["color"]}">{name}</b><br>'
             f'<span style="font-size:12px;color:#888">{g["desc"]}</span></div>',
             unsafe_allow_html=True)
-
     st.markdown("---")
     st.button("🚪 Switch annotator", on_click=logout, use_container_width=True)
 
@@ -465,38 +507,41 @@ st.markdown(
     '🔬 Classify OCT Images</div>', unsafe_allow_html=True)
 
 if not st.session_state.loaded:
-    st.info("👈 Click **Load images from Drive** in the sidebar to begin.")
+    st.info("👈 Click **Load images from Drive** in the sidebar.")
     st.stop()
 
 images = st.session_state.images
 idx    = st.session_state.idx
 total  = len(images)
-gp     = st.session_state.global_progress
 
 if total == 0:
     st.warning("No images loaded.")
     st.stop()
 
-cur        = images[idx]
-fname      = cur["name"]
-file_id    = cur["id"]
-my_grade   = st.session_state.classifications.get(fname)
-other_info = gp.get(fname)
+cur      = images[idx]
+fname    = cur["name"]
+file_id  = cur["id"]
+my_grade = st.session_state.classifications.get(fname)
+others   = st.session_state.other_annotations.get(fname, [])
 
+# Toast
 if st.session_state.just_classified:
     g = st.session_state.just_classified
     st.toast(f'{GRADES[g]["emoji"]} Labeled as {g}!', icon="✅")
     st.session_state.just_classified = None
 
-all_done = sum(1 for img in images if img["name"] in gp)
-st.progress(all_done / total, text=f"Global: {all_done}/{total} classified")
+# Your progress bar
+my_done = len(st.session_state.classifications)
+st.progress(my_done / total, text=f"Your progress: {my_done}/{total}")
 
+# Image counter
 st.markdown(
     f'<div class="fade-in">'
     f'<span class="counter-chip">Image {idx+1} of {total}</span> '
     f'&nbsp; <span style="color:#999">{fname}</span></div>',
     unsafe_allow_html=True)
 
+# Your label for this image
 if my_grade:
     c = GRADES[my_grade]["color"]
     e = GRADES[my_grade]["emoji"]
@@ -504,25 +549,25 @@ if my_grade:
         f'<div class="slide-in pulse" style="display:inline-block;'
         f'background:{c}15;border:1.5px solid {c};border-radius:10px;'
         f'padding:6px 16px;color:{c};font-weight:600;margin:8px 0">'
-        f'{e} You labeled this: {my_grade}</div>',
-        unsafe_allow_html=True)
-elif other_info:
-    oi_grade = other_info.get("grade", "")
-    oi_emoji = GRADES.get(oi_grade, {}).get("emoji", "")
-    st.markdown(
-        f'<div class="slide-in" style="display:inline-block;'
-        f'background:#667eea20;border:1.5px solid #667eea;border-radius:10px;'
-        f'padding:6px 16px;color:#667eea;font-weight:600;margin:8px 0">'
-        f'👤 Classified by {other_info["annotator"]} as {oi_emoji} {oi_grade}'
-        f'</div>', unsafe_allow_html=True)
+        f'{e} Your label: {my_grade}</div>', unsafe_allow_html=True)
 else:
     st.markdown(
         '<div class="fade-in" style="display:inline-block;'
         'background:#f0f2f6;border:1.5px dashed #ccc;border-radius:10px;'
         'padding:6px 16px;color:#999;margin:8px 0">'
-        '⬜ Not yet classified by anyone</div>',
+        '⬜ Not yet classified by you</div>', unsafe_allow_html=True)
+
+# Show what OTHER annotators labeled (for reference, not for skipping)
+if others:
+    other_text = " · ".join(
+        [f'{GRADES.get(o["grade"],{}).get("emoji","")} {o["annotator"]}: {o["grade"]}'
+         for o in others])
+    st.markdown(
+        f'<div class="fade-in" style="font-size:12px;color:#999;margin-bottom:4px">'
+        f'Other annotators: {other_text}</div>',
         unsafe_allow_html=True)
 
+# Image
 try:
     with st.spinner(""):
         img_bytes = download_image_bytes(file_id)
@@ -533,6 +578,7 @@ try:
 except Exception as e:
     st.error(f"Could not load image: {e}")
 
+# Classification buttons
 st.markdown("")
 b1, b2, b3 = st.columns(3)
 with b1:
@@ -548,6 +594,7 @@ with b3:
               use_container_width=True,
               type="primary" if my_grade == "Severe" else "secondary")
 
+# Navigation
 st.markdown("")
 n1, n2, n3, n4 = st.columns([1, 1, 1, 1])
 with n1:
@@ -560,35 +607,30 @@ with n3:
     st.button("Next →", on_click=go_next, use_container_width=True,
               disabled=(idx == total - 1))
 with n4:
-    pending = total - all_done
-    st.button(f"⏭️ ({pending})", on_click=jump_next_pending,
-              use_container_width=True, disabled=(pending == 0))
+    my_pending = total - my_done
+    st.button(f"⏭️ ({my_pending})", on_click=jump_my_next_pending,
+              use_container_width=True, disabled=(my_pending == 0))
 
-if all_done == total and total > 0:
+# Completion
+if my_done == total and total > 0:
     st.balloons()
-    st.markdown("---")
     st.markdown(
         '<div class="fade-in" style="text-align:center;padding:20px">'
         '<div style="font-size:2.5rem">🎉</div>'
         '<div style="font-size:1.3rem;font-weight:700;color:#4CAF50">'
-        'All images classified!</div></div>',
-        unsafe_allow_html=True)
+        'You\'ve classified all images!</div></div>', unsafe_allow_html=True)
 
-    annotator_counts = {}
-    for f, info in gp.items():
-        a = info["annotator"]
-        if a not in annotator_counts:
-            annotator_counts[a] = {"Mild": 0, "Moderate": 0, "Severe": 0, "total": 0}
-        if info["grade"] in annotator_counts[a]:
-            annotator_counts[a][info["grade"]] += 1
-        annotator_counts[a]["total"] += 1
+    counts = {"Mild": 0, "Moderate": 0, "Severe": 0}
+    for g in st.session_state.classifications.values():
+        if g in counts:
+            counts[g] += 1
+    c1, c2, c3 = st.columns(3)
+    for col, (name, g) in zip([c1, c2, c3], GRADES.items()):
+        with col:
+            st.markdown(
+                f'<div class="stat-card">'
+                f'<div class="stat-num" style="color:{g["color"]}">{counts[name]}</div>'
+                f'<div class="stat-label">{g["emoji"]} {name}</div></div>',
+                unsafe_allow_html=True)
 
-    st.markdown("**Contributions by annotator**")
-    for a, c in annotator_counts.items():
-        st.markdown(
-            f'<div class="grade-card" style="border-left:4px solid #667eea;">'
-            f'👤 <b>{a}</b> — {c["total"]} images '
-            f'(🟡{c["Mild"]} 🟠{c["Moderate"]} 🔴{c["Severe"]})</div>',
-            unsafe_allow_html=True)
-
-    st.success("📊 Open your Google Sheet to see all responses!")
+    st.success("📊 Your responses are saved in Google Sheets!")
