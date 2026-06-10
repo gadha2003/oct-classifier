@@ -372,6 +372,18 @@ if not st.session_state.logged_in:
                   use_container_width=True)
 
     st.markdown("---")
+    # Show annotator names only
+    try:
+        all_stats = get_all_annotator_stats()
+        if all_stats:
+            st.markdown("**Annotators**")
+            for name in all_stats.keys():
+                st.markdown(
+                    f'<div class="grade-card" style="border-left:4px solid #667eea;">'
+                    f'👤 <b>{name}</b></div>',
+                    unsafe_allow_html=True)
+    except Exception:
+        pass
 
    
 
@@ -457,14 +469,7 @@ with st.sidebar:
         st.button("⏭️ Jump to next pending", on_click=jump_my_next_pending,
                   use_container_width=True, disabled=(my_pending == 0))
 
-        # Sheet link
-        st.markdown("---")
-        st.markdown(
-            '<div style="font-size:12px">'
-            '📊 <a href="https://docs.google.com/spreadsheets" '
-            'target="_blank" style="color:#667eea">Open Google Sheets ↗</a>'
-            ' — all annotators\' responses</div>',
-            unsafe_allow_html=True)
+       
 
     st.markdown("---")
     st.markdown("**Grading reference**")
