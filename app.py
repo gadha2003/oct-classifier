@@ -373,29 +373,7 @@ if not st.session_state.logged_in:
 
     st.markdown("---")
 
-    # Show all annotators and their progress
-    try:
-        all_stats = get_all_annotator_stats()
-        if all_stats:
-            st.markdown("**Annotator progress**")
-            for name, s in all_stats.items():
-                st.markdown(
-                    f'<div class="grade-card" style="border-left:4px solid #667eea;">'
-                    f'👤 <b>{name}</b> — {s["total"]} done '
-                    f'(🟡{s["Mild"]} 🟠{s["Moderate"]} 🔴{s["Severe"]})</div>',
-                    unsafe_allow_html=True)
-    except Exception:
-        pass
-
-    st.markdown("")
-    st.markdown("**Grading reference**")
-    for name, g in GRADES.items():
-        st.markdown(
-            f'<div class="grade-card" style="border-left:4px solid {g["color"]};">'
-            f'{g["emoji"]} <b style="color:{g["color"]}">{name}</b> — '
-            f'<span style="color:#888">{g["desc"]}</span></div>',
-            unsafe_allow_html=True)
-    st.stop()
+   
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 1.5: RESUME CHECK
@@ -557,15 +535,7 @@ else:
         'padding:6px 16px;color:#999;margin:8px 0">'
         '⬜ Not yet classified by you</div>', unsafe_allow_html=True)
 
-# Show what OTHER annotators labeled (for reference, not for skipping)
-if others:
-    other_text = " · ".join(
-        [f'{GRADES.get(o["grade"],{}).get("emoji","")} {o["annotator"]}: {o["grade"]}'
-         for o in others])
-    st.markdown(
-        f'<div class="fade-in" style="font-size:12px;color:#999;margin-bottom:4px">'
-        f'Other annotators: {other_text}</div>',
-        unsafe_allow_html=True)
+
 
 # Image
 try:
